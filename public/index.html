@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ops Board</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --mute:#667085; --line:#e4e7ec; --brand:#2b59c3; --bad:#b42318; --ok:#067647; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui,sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px; background:var(--card); border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; flex:1; }
+  main { display:grid; grid-template-columns: minmax(320px,1fr) minmax(320px,1fr); gap:16px; padding:16px; max-width:1200px; margin:auto; }
+  @media (max-width:800px) { main { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px; }
+  .tabs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
+  button, select, input, textarea { font:inherit; padding:6px 10px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+  button { cursor:pointer; } button.primary { background:var(--brand); color:#fff; border-color:var(--brand); }
+  button.active { background:var(--ink); color:#fff; } button:disabled { opacity:.5; cursor:default; }
+  .filters { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
+  .filters input[type=search] { flex:1; min-width:120px; }
+  .row { padding:8px; border-bottom:1px solid var(--line); cursor:pointer; }
+  .row:hover, .row.sel { background:#eef3ff; }
+  .meta { color:var(--mute); font-size:12px; }
+  .pill { display:inline-block; padding:0 7px; border-radius:10px; font-size:11px; background:#eef0f4; margin-right:4px; }
+  .pill.urgent { background:#fde4e1; color:var(--bad); } .pill.high { background:#fff0d6; }
+  .banner { padding:8px 10px; border-radius:6px; margin:8px 0; }
+  .banner.err { background:#fde4e1; color:var(--bad); } .banner.ok { background:#dcf5e7; color:var(--ok); }
+  .actions { display:flex; gap:6px; flex-wrap:wrap; margin:8px 0; }
+  .ev { padding:6px 0; border-bottom:1px dashed var(--line); font-size:13px; }
+  .login { max-width:340px; margin:80px auto; } .login input { width:100%; margin:4px 0 8px; }
+  label { display:block; font-size:12px; color:var(--mute); }
+  .hidden { display:none; } details { margin:8px 0; } details input, details select, details textarea { width:100%; margin-bottom:6px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+const state = { token: localStorage.getItem('token'), me: null, teams: [], view: 'assigned_to_me', filters: {}, items: [], next: null, selected: null, selectedItem: null, events: [], msg: null };
+const STATUSES = ['open','in_progress','awaiting_approval','resolved','closed'];
+const NEXT = { open:['in_progress'], in_progress:['open','awaiting_approval'], awaiting_approval:['resolved','in_progress'], resolved:['closed','open'], closed:[] };
+const uuid = () => crypto.randomUUID();
+
+async function api(path, { method = 'GET', body, key } = {}) {
+  const res = await fetch('/api' + path, { method,
+    headers: { 'Content-Type': 'application/json', ...(state.token ? { Authorization: 'Bearer ' + state.token } : {}), ...(key ? { 'Idempotency-Key': key } : {}) },
+    body: body ? JSON.stringify(body) : undefined });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && path !== '/login') { logout(); }
+  if (!res.ok) throw Object.assign(new Error(data.error?.message || res.statusText), { status: res.status, code: data.error?.code, current: data.error?.current });
+  return data;
+}
+function logout() { localStorage.removeItem('token'); state.token = null; state.me = null; render(); }
+function flash(text, kind = 'err') { state.msg = { text, kind }; renderMsg(); }
+function renderMsg() { const el = $('#msg'); if (el) el.innerHTML = state.msg ? `<div class="banner ${state.msg.kind}">${esc(state.msg.text)}</div>` : ''; }
+
+async function boot() {
+  if (!state.token) return render();
+  try { const me = await api('/me'); state.me = me.user; state.teams = me.teams; await loadList(true); } catch { }
+  render();
+}
+
+async function loadList(reset) {
+  const params = new URLSearchParams({ limit: '25' });
+  if (state.view !== 'all') params.set('view', state.view);
+  for (const [k, v] of Object.entries(state.filters)) if (v) params.set(k, v);
+  if (!reset && state.next) params.set('cursor', state.next);
+  const r = await api('/items?' + params);
+  state.items = reset ? r.items : state.items.concat(r.items);
+  state.next = r.nextCursor;
+}
+
+async function select(id) {
+  state.selected = id; state.msg = null;
+  const [item, act] = await Promise.all([api('/items/' + id), api(`/items/${id}/activity`)]);
+  state.selectedItem = item; state.events = act.events; render();
+}
+
+// Re-fetch the selected item + list after any mutation (or a conflict).
+async function refresh() { await Promise.all([loadList(true), state.selected ? select(state.selected) : null]); render(); }
+
+async function act(fn, { rollback } = {}) {
+  try { await fn(); state.msg = null; await refresh(); }
+  catch (e) {
+    if (rollback) rollback();                       // undo the optimistic change
+    if (e.code === 'version_conflict') flash('This item changed while you were editing. Showing the latest version, please reload your change.');
+    else if (e.code === 'already_claimed') flash(e.message + '. Showing the latest version.');
+    else flash(e.message || 'Request failed');
+    if (e.current) state.selectedItem = e.current;
+    await refresh().catch(() => {}); renderMsg();
+  }
+}
+
+function claim() {
+  const it = state.selectedItem, prev = { ...it };
+  // optimistic: show me as assignee immediately, roll back if the server refuses
+  it.assignee_id = state.me.id; it.assignee_name = state.me.name + ' (claiming…)'; render();
+  act(() => api(`/items/${it.id}/claim`, { method: 'POST' }), { rollback: () => Object.assign(state.selectedItem, prev) });
+}
+const transition = (to) => act(() => api(`/items/${state.selectedItem.id}/transition`, { method: 'POST', body: { to, version: state.selectedItem.version }, key: uuid() }));
+const comment = () => { const body = $('#cbody').value.trim(); if (body) act(() => api(`/items/${state.selectedItem.id}/comments`, { method: 'POST', body: { body }, key: uuid() })); };
+function save() {
+  const it = state.selectedItem;
+  act(() => api('/items/' + it.id, { method: 'PATCH', body: { version: it.version, title: $('#etitle').value, priority: $('#eprio').value, description: $('#edesc').value } }));
+}
+function assign() {
+  const it = state.selectedItem, v = $('#assignee').value;
+  act(() => api(`/items/${it.id}/assign`, { method: 'POST', body: { assignee_id: v ? Number(v) : null, version: it.version } }));
+}
+let createKey = null; // one key per form submission attempt => double-click / retry safe
+function create(e) {
+  e.preventDefault(); createKey ??= uuid();
+  const f = Object.fromEntries(new FormData(e.target));
+  act(async () => { const it = await api('/items', { method: 'POST', key: createKey, body: { title: f.title, description: f.description, type: f.type, priority: f.priority, team_id: Number(f.team_id), due_date: f.due_date || null } });
+    createKey = null; e.target.reset(); state.selected = it.id; });
+}
+
+function eventText(e) {
+  const d = e.data;
+  switch (e.kind) {
+    case 'created': return 'created the item';
+    case 'status_changed': return `moved ${d.from} → ${d.to}`;
+    case 'priority_changed': return `changed priority ${d.from} → ${d.to}`;
+    case 'assigned': return d.from ? `reassigned (user ${d.from} → ${d.to ?? 'nobody'})` : `assigned to user ${d.to}${d.via === 'claim' ? ' (claimed)' : ''}`;
+    case 'updated': return 'edited ' + Object.keys(d.changes).join(', ');
+    case 'comment': return 'commented: ' + d.body;
+    default: return e.kind;
+  }
+}
+
+function detailHtml() {
+  const it = state.selectedItem; if (!it) return '<div class="meta">Select an item.</div>';
+  const team = state.teams.find((t) => t.id === it.team_id); const role = team?.role;
+  const canWrite = role && role !== 'viewer', isLead = role === 'lead' || role === 'admin';
+  const moves = NEXT[it.status].map((to) => `<button onclick="transition('${to}')" ${!canWrite ? 'disabled' : ''}>→ ${to.replace('_', ' ')}</button>`).join('');
+  const members = (team?.members || []).filter((m) => m.role !== 'viewer').map((m) => `<option value="${m.id}" ${m.id === it.assignee_id ? 'selected' : ''}>${esc(m.name)}</option>`).join('');
+  return `<h3>#${it.id} ${esc(it.title)}</h3>
+    <div class="meta"><span class="pill ${it.priority}">${it.priority}</span><span class="pill">${it.status.replace('_', ' ')}</span><span class="pill">${it.type}</span>${esc(it.team_name)} · owner: ${esc(it.assignee_name || 'unassigned')} · v${it.version} · your role: ${role}</div>
+    <p>${esc(it.description)}</p>
+    <div class="actions">${!it.assignee_id && canWrite && it.status !== 'closed' && it.status !== 'resolved' ? '<button class="primary" onclick="claim()">Claim</button>' : ''}${moves}</div>
+    ${canWrite && it.status !== 'closed' ? `<details><summary>Edit</summary><input id="etitle" value="${esc(it.title)}"><select id="eprio">${['low','medium','high','urgent'].map((p) => `<option ${p === it.priority ? 'selected' : ''}>${p}</option>`).join('')}</select><textarea id="edesc">${esc(it.description)}</textarea><button onclick="save()">Save (v${it.version})</button></details>` : ''}
+    ${isLead && it.status !== 'closed' ? `<details><summary>Reassign (lead)</summary><select id="assignee"><option value="">— nobody —</option>${members}</select><button onclick="assign()">Assign</button></details>` : ''}
+    <h4>Activity</h4>${state.events.map((e) => `<div class="ev"><b>${esc(e.actor_name)}</b> ${esc(eventText(e))}<div class="meta">${new Date(e.created_at).toLocaleString()}</div></div>`).join('')}
+    ${canWrite ? '<div style="margin-top:8px"><textarea id="cbody" rows="2" style="width:100%" placeholder="Add a comment"></textarea><button onclick="comment()">Comment</button></div>' : ''}`;
+}
+
+function render() {
+  const app = $('#app');
+  if (!state.me) {
+    app.innerHTML = `<form class="card login" onsubmit="doLogin(event)"><h2>Ops Board</h2><label>Email</label><input name="email" value="lead.payments@ops.test"><label>Password</label><input name="password" type="password" value="Passw0rd!"><button class="primary">Sign in</button><div id="msg"></div></form>`; renderMsg(); return;
+  }
+  const tabs = [['assigned_to_me', 'Assigned to me'], ['unassigned_urgent', 'Unassigned urgent'], ['awaiting_my_approval', 'Awaiting my approval'], ['all', 'All']];
+  const f = state.filters;
+  app.innerHTML = `<header><h1>Ops Board</h1><span class="meta">${esc(state.me.name)}</span><button onclick="logout()">Sign out</button></header>
+  <main><section class="card"><div class="tabs">${tabs.map(([k, l]) => `<button class="${state.view === k ? 'active' : ''}" onclick="setView('${k}')">${l}</button>`).join('')}</div>
+    <div class="filters"><input type="search" id="fq" placeholder="Search…" value="${esc(f.q || '')}" onkeydown="if(event.key==='Enter')applyFilters()">
+      <select id="fs"><option value="">any status</option>${STATUSES.map((s) => `<option ${f.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
+      <select id="fp"><option value="">any priority</option>${['low','medium','high','urgent'].map((s) => `<option ${f.priority === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
+      <button onclick="applyFilters()">Filter</button></div>
+    <div id="msg"></div>
+    ${state.items.map((i) => `<div class="row ${i.id === state.selected ? 'sel' : ''}" onclick="select(${i.id})"><span class="pill ${i.priority}">${i.priority}</span><b>${esc(i.title)}</b><div class="meta">#${i.id} · ${i.status.replace('_', ' ')} · ${esc(i.team_name)} · ${esc(i.assignee_name || 'unassigned')}</div></div>`).join('') || '<div class="meta">Nothing here.</div>'}
+    ${state.next ? '<button onclick="more()" style="margin-top:8px">Load more</button>' : ''}
+    <details><summary>New item</summary><form onsubmit="create(event)"><input name="title" placeholder="Title" required maxlength="200"><textarea name="description" placeholder="Description"></textarea>
+      <select name="team_id">${state.teams.filter((t) => t.role !== 'viewer').map((t) => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}</select>
+      <select name="type">${['incident','customer_issue','payment','compliance','task'].map((t) => `<option>${t}</option>`).join('')}</select>
+      <select name="priority">${['low','medium','high','urgent'].map((t) => `<option>${t}</option>`).join('')}</select>
+      <input name="due_date" type="date"><button class="primary">Create</button></form></details></section>
+  <section class="card">${detailHtml()}</section></main>`;
+  renderMsg();
+}
+
+async function doLogin(e) {
+  e.preventDefault(); const f = Object.fromEntries(new FormData(e.target));
+  try { const r = await api('/login', { method: 'POST', body: f }); state.token = r.token; localStorage.setItem('token', r.token); await boot(); }
+  catch (err) { flash(err.message); }
+}
+const setView = async (v) => { state.view = v; await loadList(true); render(); };
+const applyFilters = async () => { state.filters = { q: $('#fq').value, status: $('#fs').value, priority: $('#fp').value }; await loadList(true); render(); };
+const more = async () => { await loadList(false); render(); };
+boot();
+</script>
+</body>
+</html>
